@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -104,6 +105,18 @@ bool ParseHostAndPortFromRequestUrl(const std::string& url, std::string& host, s
     }
     port = authority.substr(colonPos + 1);
     return !host.empty();
+}
+
+bool TryGetProcessId(const Json::Value& value, uint32_t& processId) {
+    if (!value.isUInt64()) {
+        return false;
+    }
+    const auto raw = value.asUInt64();
+    if (raw > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    processId = static_cast<uint32_t>(raw);
+    return true;
 }
 
 /// Builtin cmdline allow rules used when the user does not configure any whitelist/blacklist.
@@ -292,6 +305,7 @@ void FillAgentsightCommonCorrelation(const AgentsightLlmRecord& rec,
     setStr(StringView("gen_ai.turn.id"), rec.mConversationId);
     if (rec.mPid != 0) {
         log->SetContent("pid", std::to_string(rec.mPid));
+        log->SetContent("process.pid", std::to_string(rec.mPid));
     }
     setStr(StringView("comm"), rec.mProcessName);
     setStr(StringView("cmdline"), rec.mCmdline);
@@ -346,6 +360,7 @@ void FillAgentsightCombinedLlmLog(const AgentsightLlmRecord& rec,
     SetLogTimestampFromNs(log, rec.mTimestampNs);
     FillAgentsightOtlpTimeFields(log, rec.mTimestampNs);
     FillAgentsightCommonCorrelation(rec, setStr, log);
+    setStr(StringView("gen_ai.tool.call.id"), ExtractUniqueToolCallId(rec.mResponseMessagesJson));
     setStr(StringView("gen_ai.response.id"), rec.mResponseId);
 
     log->SetContent("gen_ai.response.duration", std::to_string(rec.mDurationNs / 1000000ULL));
@@ -413,6 +428,7 @@ void FillAgentsightModelResponseLog(const AgentsightLlmRecord& rec,
     log->SetContent(StringView("event.name"), StringView("gen_ai.model.response"));
     FillAgentsightCommonCorrelation(rec, setStr, log, eventId);
     setStr(StringView("gen_ai.response.id"), rec.mResponseId);
+    setStr(StringView("gen_ai.tool.call.id"), ExtractUniqueToolCallId(rec.mResponseMessagesJson));
     setStr(StringView("gen_ai.step.id"), payload.stepId);
     if (payload.eventSequenceResponse > 0) {
         log->SetContent("gen_ai.event.sequence", std::to_string(payload.eventSequenceResponse));
@@ -567,6 +583,9 @@ bool AgentsightManager::RestartAgentSightLocked(const SecurityOptions& opts) {
             sym->config_set_enforcer_socket(cfg, opts.mAgentsightEnforcerSocket.c_str());
             mSecurityAuditEnabled = true;
         } else {
+            if (sym->config_set_enable_security_audit) {
+                sym->config_set_enable_security_audit(cfg, 0);
+            }
             LOG_WARNING(sLogger,
                         ("AgentSight security audit",
                          "requested but read_v2/configuration symbols are unavailable; continuing with LLM only"));
@@ -661,9 +680,8 @@ void AgentsightManager::OnLlmCallback(const AgentsightLLMData* data, void* user_
 }
 
 void AgentsightManager::OnEventCallback(const AgentsightEvent* data, void* user_data) {
-    static constexpr uint32_t kSecurityEventType = 3;
     static constexpr uint32_t kMaxSecurityPayloadBytes = 4U * 1024U * 1024U;
-    if (!data || !user_data || static_cast<uint32_t>(data->event_type) != kSecurityEventType) {
+    if (!data || !user_data || data->event_type != AGENTSIGHT_EVENT_TYPE_SECURITY) {
         return;
     }
     if (data->schema_version != 1 || !data->payload_json || data->payload_json_len == 0
@@ -994,9 +1012,26 @@ int AgentsightManager::HandleSecurityEvent(const AgentsightSecurityRecord& rec) 
             }
             if (identity["conversation_id"].isString()) {
                 log->SetContent("gen_ai.turn.id", identity["conversation_id"].asString());
+                log->SetContent("gen_ai.conversation.id", identity["conversation_id"].asString());
             }
-            if (identity["pid"].isInt()) {
-                log->SetContent("process.pid", std::to_string(identity["pid"].asInt()));
+            if (identity["tool_call_id"].isString()) {
+                log->SetContent("gen_ai.tool.call.id", identity["tool_call_id"].asString());
+            }
+            uint32_t processId = 0;
+            if (TryGetProcessId(identity["pid"], processId)) {
+                log->SetContent("process.pid", std::to_string(processId));
+            }
+            if (identity["process_start_time"].isUInt64()) {
+                log->SetContent("process.start_time", std::to_string(identity["process_start_time"].asUInt64()));
+            }
+            if (TryGetProcessId(identity["ppid"], processId)) {
+                log->SetContent("process.parent.pid", std::to_string(processId));
+            }
+            if (identity["cgroup_id"].isUInt64()) {
+                log->SetContent("container.cgroup.id", std::to_string(identity["cgroup_id"].asUInt64()));
+            }
+            if (identity["binding_id"].isString()) {
+                log->SetContent("agentsight.binding.id", identity["binding_id"].asString());
             }
             FlattenSecurityJson(identity, "agentsight.identity", log);
         }
